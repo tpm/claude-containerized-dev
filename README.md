@@ -17,7 +17,7 @@ Claude Code plugin for containerized multi-workspace development environments.
 ### From the marketplace
 
 ```bash
-claude /plugin marketplace add notthatwoz/claude-containerized-dev
+claude /plugin marketplace add tpm/claude-containerized-dev
 claude /plugin install containerized-dev
 ```
 
@@ -28,7 +28,7 @@ Add to `~/.claude/settings.json`:
 ```json
 {
   "extraKnownMarketplaces": [
-    "notthatwoz/claude-containerized-dev"
+    "tpm/claude-containerized-dev"
   ]
 }
 ```
