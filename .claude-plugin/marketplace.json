@@ -1,5 +1,5 @@
 {
-  "name": "claude-plugins",
+  "name": "tpm-dev",
   "description": "Containerized multi-workspace development environments with Docker, git worktrees, Claude agent spawning, session handoff, and host daemon services",
   "owner": {
     "name": "Matthew Wozniak",
