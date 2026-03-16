@@ -123,6 +123,7 @@ dev/
 | `release [CRATE]` | Cross-platform build: host-native + container, output to `dist/` |
 | `worktree ls\|add\|rm` | Manage git worktrees |
 | `daemon start\|stop\|status\|logs` | Manage the host daemon process |
+| `caddy register\|deregister` | Register/deregister Caddy site blocks (web projects with custom domains) |
 | `handoff SHORTCODE` | Start container claude with handoff context |
 | `handoffs [list\|clean]` | List handoff status or clean completed |
 | `build` | Build dev Docker image |
@@ -510,7 +511,10 @@ server.listen(PORT, "0.0.0.0", () => { ... });
 | `POST /spawn` | Create workspace + start container + optional headless agent |
 | `GET /status` | List all workspaces with status |
 | `GET /worktree/:name/activity` | Git log, status, agent log tail |
-| `DELETE /worktree/:name` | Stop container + remove workspace |
+| `DELETE /worktree/:name` | Stop container + remove workspace (also deregisters Caddy site block) |
+| `POST /caddy/register` | Register Caddy site block for workspace (web projects with custom domains) |
+| `POST /caddy/deregister` | Remove Caddy site block for workspace |
+| `GET /caddy/sites` | List registered Caddy site blocks |
 
 ### Daemon Management in dev.sh
 
@@ -885,7 +889,8 @@ Every containerized-dev project has a manifest — the set of resources the skil
 |----------|------|---------------------|
 | Host daemon | `dev/daemon.cjs` | When project needs host services (builds, proxy, etc.) |
 | Host build helper | `dev/host-build` | When container can't build certain targets |
-| Reverse proxy config | Managed block in `Caddyfile`/`nginx.conf` | When project uses custom local domains |
+| Caddy site config | `dev/caddy.json` | When project uses custom local domains (Reverse Proxy section) |
+| Caddyfile import | `import .worktrees/.caddy-sites` in root `Caddyfile` | When project uses custom local domains |
 
 ### Handoff Command Template
 
@@ -1021,11 +1026,171 @@ This ensures every improvement is available to ALL projects that use the skill, 
 
 ## Reverse Proxy (Optional, Web Projects Only)
 
-If the project uses custom local domains, the user may want a reverse proxy (Caddy, nginx, etc.) in front of the dev server. This is project-specific — don't scaffold it unless asked. The pattern is:
+If the project uses custom local domains, the user may want a reverse proxy (Caddy) in front of the dev server. This is project-specific — don't scaffold it unless asked.
 
-1. A managed block in the proxy config that routes domains to the workspace's allocated port
-2. A `switch` command in dev.sh that rewrites the block and reloads the proxy
-3. An endpoint on the daemon that handles the switch (so containers can trigger it via `host.docker.internal`)
+### Design: Site Registration Model
+
+Each workspace **registers** its own Caddy site block. Multiple workspaces coexist — no "switching" ownership. Conflicts (e.g., two workspaces claiming the same domain) cause `caddy reload` to fail, and the error is surfaced to the caller.
+
+### 1. Project-level site config: `dev/caddy.json`
+
+Each project declares what Caddy site blocks it needs. This replaces hardcoded domain constants.
+
+```json
+{
+  "sites": [
+    {
+      "domains": [
+        "app.myproject.localhost",
+        "api.myproject.localhost",
+        "webhooks.myproject.localhost"
+      ],
+      "directives": [
+        "import cors https://myproject.localhost"
+      ]
+    }
+  ]
+}
+```
+
+`domains` — the Caddy site address(es) for this block. `directives` — extra Caddy directives injected into the block (CORS snippets, headers, etc.). The `reverse_proxy` directive is generated automatically from the workspace's allocated port.
+
+### 2. Managed Caddyfile: `.worktrees/.caddy-sites` (generated, gitignored)
+
+Per-workspace blocks with markers:
+
+```caddy
+# containerized-dev:root:begin
+app.myproject.localhost, api.myproject.localhost {
+  reverse_proxy localhost:5173
+  import cors https://myproject.localhost
+}
+# containerized-dev:root:end
+
+# containerized-dev:fix-auth:begin
+app.myproject.localhost, api.myproject.localhost {
+  reverse_proxy localhost:5174
+  import cors https://myproject.localhost
+}
+# containerized-dev:fix-auth:end
+```
+
+The second block would fail on `caddy reload` since both claim the same domains — that's the desired behavior. The error is surfaced to the user.
+
+### 3. Root Caddyfile change
+
+The project's root Caddyfile imports the managed file instead of containing a managed block:
+
+```caddy
+import .worktrees/.caddy-sites
+```
+
+Static entries (main site config, snippet definitions, etc.) remain in the Caddyfile untouched.
+
+### CORS Snippet
+
+When `dev/caddy.json` uses `import cors {origin}`, define this reusable snippet in the root Caddyfile:
+
+```caddy
+(cors) {
+  @cors_preflight method OPTIONS
+  @cors header Origin {args.0}
+
+  handle @cors_preflight {
+    header Access-Control-Allow-Origin "{args.0}"
+    header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE"
+    header Access-Control-Allow-Headers "Content-Type"
+    header Access-Control-Max-Age "3600"
+    header Access-Control-Allow-Credentials "true"
+    respond "" 204
+  }
+
+  handle @cors {
+    header Access-Control-Allow-Origin "{args.0}"
+    header Access-Control-Expose-Headers "Link"
+    header Access-Control-Allow-Credentials "true"
+  }
+}
+```
+
+This is a static snippet — it belongs in the root Caddyfile alongside other project-level config, not in the generated `.caddy-sites` file.
+
+### 4. Daemon API: Caddy Registration
+
+**Remove** from old pattern: hardcoded domain constants, `rewriteCaddyfile()`, old `reloadCaddy()`, `POST /server/switch`.
+
+**Add to `daemon.cjs`**:
+
+- `readCaddyConfig()` — reads `dev/caddy.json`
+- `generateSiteBlock(workspace, port)` — builds Caddy block text from config + port, wrapped in `# containerized-dev:{workspace}:begin/end` markers
+- `registerSiteBlock(workspace, port)` — removes old block for this workspace, appends new one, calls `reloadCaddy()`. **On reload failure**: rolls back `.caddy-sites` to previous content, rethrows error
+- `deregisterSiteBlock(workspace)` — removes block by markers, reloads
+- `reloadCaddy()` — uses `run()` (not `runSafe()`), captures stderr on failure and throws with the Caddy error message
+
+**New daemon endpoints**:
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /caddy/register` `{ workspace }` | Register site block, returns 200 or 409 with error detail |
+| `POST /caddy/deregister` `{ workspace }` | Remove site block |
+| `GET /caddy/sites` | List registered blocks (optional, nice-to-have) |
+
+**Modified**: `DELETE /worktree/:name` — calls `deregisterSiteBlock` during cleanup.
+
+### 5. Shell changes: `dev.sh`
+
+**Remove**: `caddy_switch()`
+
+**Add**:
+
+```bash
+caddy_register() {
+  local ws="$1"
+  local resp
+  resp=$(curl -s -w "\n%{http_code}" -X POST \
+    "http://localhost:$DAEMON_PORT/caddy/register" \
+    -H "Content-Type: application/json" \
+    -d "{\"workspace\": \"$ws\"}")
+  local body status
+  body=$(echo "$resp" | head -n -1)
+  status=$(echo "$resp" | tail -1)
+  if [[ "$status" != "200" ]]; then
+    echo "Error: Caddy registration failed for workspace '$ws':" >&2
+    echo "$body" >&2
+    exit 1
+  fi
+}
+
+caddy_deregister() {
+  local ws="$1"
+  curl -s -X POST "http://localhost:$DAEMON_PORT/caddy/deregister" \
+    -H "Content-Type: application/json" \
+    -d "{\"workspace\": \"$ws\"}" > /dev/null 2>&1 || true
+}
+```
+
+**Modified functions**:
+
+- `caddy_start()` — also `touch "$WORKTREES_DIR/.caddy-sites"` (Caddy import requires the file to exist)
+- `cmd_up()` — replace `caddy_switch` with `caddy_register`
+- `cmd_server()` — add `caddy_start` + `caddy_register` before starting dev server (makes Caddy a prerequisite)
+- `cmd_down()` — add `caddy_deregister` after stopping container
+- `cmd_caddy()` — replace `switch` subcommand with `register`/`deregister`
+
+### 6. Error surfacing flow
+
+```
+cmd_server → caddy_register() → curl POST /caddy/register
+  → daemon: registerSiteBlock() → writes .caddy-sites → reloadCaddy()
+    → caddy reload fails (e.g., duplicate domain)
+    → daemon: rolls back .caddy-sites, returns 409 { error, detail }
+  → caddy_register(): prints error to stderr, exits 1
+  → cmd_server: never starts dev server
+```
+
+### 7. Cleanup
+
+Workspace removal (any path) calls `deregisterSiteBlock` to remove the block from `.caddy-sites` and reload Caddy.
 
 ## Extending the Daemon
 
@@ -1034,7 +1199,7 @@ The daemon is the extension point for any host-only capability containers need. 
 - **Build services**: Proxy builds requiring host SDKs/toolchains (Metal, Xcode, etc.)
 - **Credential sync**: Expose host keychain/secret-manager lookups
 - **File watching**: Trigger container actions on host filesystem events
-- **Reverse proxy management**: Rewrite proxy configs and reload
+- **Reverse proxy management**: Register/deregister Caddy site blocks per workspace
 
 All endpoints should follow existing conventions:
 - JSON request/response for simple operations
