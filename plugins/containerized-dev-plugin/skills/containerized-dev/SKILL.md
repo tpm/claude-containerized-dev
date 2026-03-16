@@ -16,6 +16,18 @@ Docker-based development with multi-workspace support, global port allocation, a
 - **Daemon**: Node.js HTTP server on the host, reachable from containers via `host.docker.internal`. Bridges host-only capabilities (native builds, worktree management) to containerized agents.
 - **Spawn/attach**: Run headless Claude agents in worktree containers, attach interactively later.
 
+## Global State
+
+**Location**: `~/.local/share/dev-workspaces/`
+
+| File | Purpose |
+|------|---------|
+| `ports.json` | Port registry — prevents conflicts across all projects |
+| `Caddyfile` | Root Caddyfile — static config (CORS snippet, etc.) + `import caddy-sites` |
+| `caddy-sites` | Generated Caddy site blocks from all projects/workspaces |
+
+All keys use `{project}:{workspace}` format.
+
 ## Global Port Registry
 
 **Location**: `~/.local/share/dev-workspaces/ports.json`
@@ -890,7 +902,6 @@ Every containerized-dev project has a manifest — the set of resources the skil
 | Host daemon | `dev/daemon.cjs` | When project needs host services (builds, proxy, etc.) |
 | Host build helper | `dev/host-build` | When container can't build certain targets |
 | Caddy site config | `dev/caddy.json` | When project uses custom local domains (Reverse Proxy section) |
-| Caddyfile import | `import .worktrees/.caddy-sites` in root `Caddyfile` | When project uses custom local domains |
 
 ### Handoff Command Template
 
@@ -1028,9 +1039,48 @@ This ensures every improvement is available to ALL projects that use the skill, 
 
 If the project uses custom local domains, the user may want a reverse proxy (Caddy) in front of the dev server. This is project-specific — don't scaffold it unless asked.
 
-### Design: Site Registration Model
+### Design: Global Site Registration
 
-Each workspace **registers** its own Caddy site block. Multiple workspaces coexist — no "switching" ownership. Conflicts (e.g., two workspaces claiming the same domain) cause `caddy reload` to fail, and the error is surfaced to the caller.
+There is one Caddy process on the system listening on 443. Site blocks from **all projects and workspaces** are registered into a single shared file, just like the global port registry. Each workspace registers its own block; conflicts (e.g., two workspaces claiming the same domain) cause `caddy reload` to fail, and the error is surfaced to the caller.
+
+### Global Caddy State
+
+**Location**: `~/.local/share/dev-workspaces/` (same directory as `ports.json`)
+
+| File | Purpose |
+|------|---------|
+| `Caddyfile` | Root Caddyfile — static config + `import caddy-sites` |
+| `caddy-sites` | Generated file with per-workspace site blocks (markers delimit each) |
+
+The root `Caddyfile` is created once (on first project that needs Caddy) and rarely changes. The `caddy-sites` file is managed entirely by daemon registrations.
+
+Example root Caddyfile:
+
+```caddy
+(cors) {
+  @cors_preflight method OPTIONS
+  @cors header Origin {args.0}
+
+  handle @cors_preflight {
+    header Access-Control-Allow-Origin "{args.0}"
+    header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE"
+    header Access-Control-Allow-Headers "Content-Type"
+    header Access-Control-Max-Age "3600"
+    header Access-Control-Allow-Credentials "true"
+    respond "" 204
+  }
+
+  handle @cors {
+    header Access-Control-Allow-Origin "{args.0}"
+    header Access-Control-Expose-Headers "Link"
+    header Access-Control-Allow-Credentials "true"
+  }
+}
+
+# Project-specific static sites can be added here
+
+import caddy-sites
+```
 
 ### 1. Project-level site config: `dev/caddy.json`
 
@@ -1055,77 +1105,43 @@ Each project declares what Caddy site blocks it needs. This replaces hardcoded d
 
 `domains` — the Caddy site address(es) for this block. `directives` — extra Caddy directives injected into the block (CORS snippets, headers, etc.). The `reverse_proxy` directive is generated automatically from the workspace's allocated port.
 
-### 2. Managed Caddyfile: `.worktrees/.caddy-sites` (generated, gitignored)
+### 2. Managed site blocks: `~/.local/share/dev-workspaces/caddy-sites`
 
-Per-workspace blocks with markers:
+Markers use `{project}:{workspace}` — the same key format as the port registry:
 
 ```caddy
-# containerized-dev:root:begin
+# containerized-dev:myproject:root:begin
 app.myproject.localhost, api.myproject.localhost {
   reverse_proxy localhost:5173
   import cors https://myproject.localhost
 }
-# containerized-dev:root:end
+# containerized-dev:myproject:root:end
 
-# containerized-dev:fix-auth:begin
-app.myproject.localhost, api.myproject.localhost {
-  reverse_proxy localhost:5174
-  import cors https://myproject.localhost
+# containerized-dev:otherapp:root:begin
+otherapp.localhost {
+  reverse_proxy localhost:5175
 }
-# containerized-dev:fix-auth:end
+# containerized-dev:otherapp:root:end
 ```
 
-The second block would fail on `caddy reload` since both claim the same domains — that's the desired behavior. The error is surfaced to the user.
+All projects share this file. A workspace from project A and a workspace from project B coexist. If two workspaces (from the same or different projects) claim the same domain, `caddy reload` fails and the registering workspace gets the error.
 
-### 3. Root Caddyfile change
-
-The project's root Caddyfile imports the managed file instead of containing a managed block:
-
-```caddy
-import .worktrees/.caddy-sites
-```
-
-Static entries (main site config, snippet definitions, etc.) remain in the Caddyfile untouched.
-
-### CORS Snippet
-
-When `dev/caddy.json` uses `import cors {origin}`, define this reusable snippet in the root Caddyfile:
-
-```caddy
-(cors) {
-  @cors_preflight method OPTIONS
-  @cors header Origin {args.0}
-
-  handle @cors_preflight {
-    header Access-Control-Allow-Origin "{args.0}"
-    header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE"
-    header Access-Control-Allow-Headers "Content-Type"
-    header Access-Control-Max-Age "3600"
-    header Access-Control-Allow-Credentials "true"
-    respond "" 204
-  }
-
-  handle @cors {
-    header Access-Control-Allow-Origin "{args.0}"
-    header Access-Control-Expose-Headers "Link"
-    header Access-Control-Allow-Credentials "true"
-  }
-}
-```
-
-This is a static snippet — it belongs in the root Caddyfile alongside other project-level config, not in the generated `.caddy-sites` file.
-
-### 4. Daemon API: Caddy Registration
-
-**Remove** from old pattern: hardcoded domain constants, `rewriteCaddyfile()`, old `reloadCaddy()`, `POST /server/switch`.
+### 3. Daemon API: Caddy Registration
 
 **Add to `daemon.cjs`**:
 
-- `readCaddyConfig()` — reads `dev/caddy.json`
-- `generateSiteBlock(workspace, port)` — builds Caddy block text from config + port, wrapped in `# containerized-dev:{workspace}:begin/end` markers
-- `registerSiteBlock(workspace, port)` — removes old block for this workspace, appends new one, calls `reloadCaddy()`. **On reload failure**: rolls back `.caddy-sites` to previous content, rethrows error
-- `deregisterSiteBlock(workspace)` — removes block by markers, reloads
-- `reloadCaddy()` — uses `run()` (not `runSafe()`), captures stderr on failure and throws with the Caddy error message
+```
+CADDY_DIR = ~/.local/share/dev-workspaces
+CADDY_SITES = CADDY_DIR/caddy-sites
+CADDYFILE = CADDY_DIR/Caddyfile
+```
+
+- `readCaddyConfig()` — reads `dev/caddy.json` from the project
+- `generateSiteBlock(project, workspace, port)` — builds Caddy block text from config + port, wrapped in `# containerized-dev:{project}:{workspace}:begin/end` markers
+- `registerSiteBlock(project, workspace, port)` — removes old block for this project:workspace, appends new one, calls `reloadCaddy()`. **On reload failure**: rolls back `caddy-sites` to previous content, rethrows error
+- `deregisterSiteBlock(project, workspace)` — removes block by markers, reloads
+- `ensureCaddyfile()` — creates root `Caddyfile` + empty `caddy-sites` if they don't exist yet
+- `reloadCaddy()` — runs `caddy reload --config CADDYFILE`, captures stderr on failure and throws with the Caddy error message
 
 **New daemon endpoints**:
 
@@ -1133,11 +1149,13 @@ This is a static snippet — it belongs in the root Caddyfile alongside other pr
 |----------|-------------|
 | `POST /caddy/register` `{ workspace }` | Register site block, returns 200 or 409 with error detail |
 | `POST /caddy/deregister` `{ workspace }` | Remove site block |
-| `GET /caddy/sites` | List registered blocks (optional, nice-to-have) |
+| `GET /caddy/sites` | List all registered blocks across all projects |
+
+The daemon already knows `PROJECT_NAME` from its context. Endpoints accept `{ workspace }` and derive the full `{project}:{workspace}` key internally.
 
 **Modified**: `DELETE /worktree/:name` — calls `deregisterSiteBlock` during cleanup.
 
-### 5. Shell changes: `dev.sh`
+### 4. Shell changes: `dev.sh`
 
 **Remove**: `caddy_switch()`
 
@@ -1171,26 +1189,26 @@ caddy_deregister() {
 
 **Modified functions**:
 
-- `caddy_start()` — also `touch "$WORKTREES_DIR/.caddy-sites"` (Caddy import requires the file to exist)
+- `caddy_start()` — starts Caddy with the global Caddyfile (`~/.local/share/dev-workspaces/Caddyfile`) if not already running
 - `cmd_up()` — replace `caddy_switch` with `caddy_register`
 - `cmd_server()` — add `caddy_start` + `caddy_register` before starting dev server (makes Caddy a prerequisite)
 - `cmd_down()` — add `caddy_deregister` after stopping container
 - `cmd_caddy()` — replace `switch` subcommand with `register`/`deregister`
 
-### 6. Error surfacing flow
+### 5. Error surfacing flow
 
 ```
 cmd_server → caddy_register() → curl POST /caddy/register
-  → daemon: registerSiteBlock() → writes .caddy-sites → reloadCaddy()
-    → caddy reload fails (e.g., duplicate domain)
-    → daemon: rolls back .caddy-sites, returns 409 { error, detail }
+  → daemon: registerSiteBlock() → writes caddy-sites → reloadCaddy()
+    → caddy reload fails (e.g., duplicate domain across projects)
+    → daemon: rolls back caddy-sites, returns 409 { error, detail }
   → caddy_register(): prints error to stderr, exits 1
   → cmd_server: never starts dev server
 ```
 
-### 7. Cleanup
+### 6. Cleanup
 
-Workspace removal (any path) calls `deregisterSiteBlock` to remove the block from `.caddy-sites` and reload Caddy.
+Workspace removal (any path) calls `deregisterSiteBlock` to remove the block from `caddy-sites` and reload Caddy.
 
 ## Extending the Daemon
 

@@ -1,6 +1,6 @@
 {
   "name": "containerized-dev",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Set up and manage containerized multi-workspace development environments with Docker. Handles global port allocation (no conflicts across projects), git worktrees, Claude agent spawning, host-to-container session handoff, host daemon for container-to-host services (native builds, credential sync), and project-specific container configuration. Use when user wants to set up dev containers, manage workspaces, spawn parallel Claude agents in containers, trigger host-native builds from containers, hand off sessions to containers, or troubleshoot their dev.sh setup.",
   "author": {
     "name": "Matthew Wozniak",
