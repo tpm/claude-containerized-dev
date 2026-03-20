@@ -8,6 +8,64 @@ allowed-tools: Bash, Read, Write, Edit, Glob, Grep, Agent
 
 Docker-based development with multi-workspace support, global port allocation, and Claude agent integration. Works for any project type (Node.js, Rust, Python, Go, etc.).
 
+## Skill Resources
+
+This skill bundles scripts in its `resources/` directory (relative to this SKILL.md):
+
+| Resource | Purpose |
+|----------|---------|
+| `resources/credential-sync` | Host-side watcher that syncs `~/.claude/mnt/credentials/.credentials.json` ↔ macOS Keychain |
+
+These are installed to the host during project initialization (see Installation section).
+
+## Host Prerequisites
+
+These must be installed on the macOS host before initializing a project. The skill checks and prompts for missing prerequisites during `init` and `sync`.
+
+| Dependency | Install | Purpose |
+|------------|---------|---------|
+| Docker Desktop | `brew install --cask docker` | Container runtime |
+| Node.js | `brew install node` | Host daemon, Claude Code |
+
+### Installation (run by skill during init)
+
+```bash
+install_skill_resources() {
+  local skill_dir
+  # Resolve the skill's resources directory (relative to where the skill is installed)
+  skill_dir="$(find ~/.claude/skills ~/.claude/plugins -name credential-sync -path '*/containerized-dev/resources/*' -print -quit 2>/dev/null)"
+  skill_dir="$(dirname "$skill_dir")"
+
+  if [[ -z "$skill_dir" ]] || [[ ! -d "$skill_dir" ]]; then
+    echo "Error: Could not find containerized-dev skill resources" >&2
+    return 1
+  fi
+
+  # ── Check prerequisites (hard stop on missing) ──
+  local missing=()
+  command -v docker &>/dev/null || missing+=("Docker Desktop: brew install --cask docker")
+  command -v node &>/dev/null || missing+=("Node.js: brew install node")
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "Missing prerequisites:" >&2
+    printf "  - %s\n" "${missing[@]}" >&2
+    return 1
+  fi
+
+  # ── Install credential-sync ──
+  local dest="$HOME/.local/bin/credential-sync"
+  mkdir -p "$(dirname "$dest")"
+  cp "$skill_dir/credential-sync" "$dest"
+  chmod +x "$dest"
+  echo "Installed credential-sync to $dest" >&2
+
+  # ── Ensure shared file directory exists ──
+  mkdir -p "$HOME/.claude/mnt/credentials"
+}
+```
+
+This is called during `cmd_init()` in dev.sh and during `sync` when the skill detects the resource is missing or outdated.
+
 ## Core Concepts
 
 - **Workspace**: An isolated dev environment. `root` = main repo, others = git worktrees.
@@ -183,6 +241,8 @@ services:
       # Claude: container's own persistent state + host config read-only
       - claude-state:/root/.claude
       - ${HOST_HOME:-~}/.claude:/host-claude:ro
+      # Shared bind-mount — all containers see the same credential file instantly via virtiofs
+      - ${HOST_HOME:-~}/.claude/mnt/credentials/.credentials.json:/root/.claude/.credentials.json
     ports:
       - "${HOST_PORT:-5173}:${DEV_PORT:-5173}"
     environment:
@@ -362,9 +422,32 @@ else:
 print(f'skill_excludes={\" \".join(s.get(\"exclude\", []))}')
 " 2>/dev/null)" || return
 
-  # Credentials
-  if [[ "\$share_creds" == "true" ]] && [[ -f "\$HOST_CLAUDE/.credentials.json" ]]; then
-    ln -sf "\$HOST_CLAUDE/.credentials.json" "\$CLAUDE_DIR/.credentials.json"
+  # Credentials — shared bind-mount provides ~/.claude/.credentials.json from host.
+  # Docker creates the file as empty if the host path doesn't exist yet; use -s (not -f) to detect that.
+  if [[ "\$share_creds" == "true" ]]; then
+    if [[ ! -s "\$CLAUDE_DIR/.credentials.json" ]] && [[ -f "\$HOST_CLAUDE/.credentials.json" ]]; then
+      cp -f "\$HOST_CLAUDE/.credentials.json" "\$CLAUDE_DIR/.credentials.json"
+    fi
+    # Mark Claude as already initialized so it skips the onboarding/login flow
+    if [[ -f /root/.claude.json ]]; then
+      python3 -c "
+import json
+with open('/root/.claude.json') as f: d = json.load(f)
+d['hasCompletedOnboarding'] = True
+with open('/root/.claude.json', 'w') as f: json.dump(d, f, indent=2)
+"
+    else
+      echo '{"hasCompletedOnboarding":true}' > /root/.claude.json
+    fi
+  fi
+
+  # Wrap claude to skip permissions (containers are already sandboxed)
+  # IS_SANDBOX=1 tells Claude Code to allow --dangerously-skip-permissions as root
+  if [[ -L /usr/local/bin/claude ]]; then
+    CLAUDE_REAL="\$(readlink -f /usr/local/bin/claude)"
+    rm /usr/local/bin/claude
+    printf '#!/bin/bash\nexport IS_SANDBOX=1\nexec "%s" --dangerously-skip-permissions "\$@"\n' "\$CLAUDE_REAL" > /usr/local/bin/claude
+    chmod +x /usr/local/bin/claude
   fi
 
   # Commands — symlink each file individually
@@ -439,6 +522,10 @@ Stop container first, then remove worktree, branch, and free the port.
 
 Containers get their **own persistent Claude state** via a named Docker volume (`claude-state`), separate from the host's `~/.claude`. The host's Claude config is mounted read-only at `/host-claude`. On container startup, the entrypoint reads `dev/claude-sharing.json` and symlinks declared items into the container's `/root/.claude/`.
 
+**Permissions**: The entrypoint wraps the `claude` binary to always pass `--dangerously-skip-permissions` with `IS_SANDBOX=1`. Containers run as root by default, and Claude Code rejects `--dangerously-skip-permissions` as root unless `IS_SANDBOX=1` is set. Containers are already sandboxed — permission prompts add friction with no security benefit. This means `claude` just works in any container context (interactive, headless, handoff) with no permission prompts.
+
+**Onboarding**: The entrypoint sets `hasCompletedOnboarding: true` in `/root/.claude.json` so Claude skips the first-run login flow.
+
 **`dev/claude-sharing.json`** — declares what host Claude state to share:
 
 ```json
@@ -481,28 +568,100 @@ The container-env skill should cover:
 | Python ML | GPU not available in container, use host for CUDA builds, CPU inference works |
 | Go + external APIs | Mock services at `host.docker.internal:{port}`, don't modify docker-compose |
 
-### Credential Sync (macOS)
+### Credential Sync (macOS) — Shared Bind-Mount
 
-Before launching Claude in a container, sync credentials from Keychain to the host's `~/.claude/`:
+Container Claude sessions share OAuth tokens. When one session refreshes a token, the old token is invalidated — all other sessions must see the new token immediately. A **shared bind-mount** of a single file on the host gives all containers instant access to the same credentials via Docker's virtiofs. A lightweight host-side watcher keeps the macOS Keychain in sync (for the host's benefit — containers don't care about the Keychain).
 
-```bash
-security find-generic-password -s 'Claude Code-credentials' -w \
-  > ~/.claude/.credentials.json 2>/dev/null || true
+**Why**: Without this, token refreshes in one container don't propagate to others or back to the host. Sessions go stale and get logged out. With a shared file, all containers see changes instantly (zero delay via virtiofs). The Keychain watcher is async — it's only needed so host-side Claude sessions also stay current.
+
+#### Architecture
+
+```
+macOS Keychain
+    ↕ (credential-sync watcher, async)
+~/.claude/mnt/credentials/.credentials.json  (regular file on host)
+    ├── bind-mount → Container A: /root/.claude/.credentials.json
+    ├── bind-mount → Container B: /root/.claude/.credentials.json
+    └── bind-mount → Container C: /root/.claude/.credentials.json
 ```
 
-The entrypoint then symlinks this into the container's Claude state if `credentials: true` in `claude-sharing.json`.
+- **Inter-container sync**: Instant. Same file via virtiofs. Zero delay.
+- **Keychain sync**: Async watcher on host. For host Claude's benefit only — containers don't care.
+
+#### Credential Sync Script: `credential-sync`
+
+**Source**: `resources/credential-sync` (bundled with this skill)
+**Installed to**: `~/.local/bin/credential-sync` (by `install_skill_resources()` during init)
+
+Pure bash script. No Python, no FUSE, no system extensions.
+
+**Interface:**
+```
+credential-sync seed              # Keychain → shared file (one-shot)
+credential-sync start [--fg]      # seed + start watcher (daemonizes by default)
+credential-sync stop              # kill watcher
+credential-sync status            # running or not
+```
+
+**Watcher**: Polls with `stat -f %m` every 2 seconds. On change → updates Keychain via `security delete-generic-password` + `security add-generic-password`. On startup → seeds shared file from Keychain (falls back to `~/.claude/.credentials.json`).
+
+**PID file**: `~/.claude/mnt/.credential-sync.pid`
+
+Do **not** inline or duplicate this script in project resources. It's installed from the skill's `resources/` directory to `~/.local/bin/` and shared across all projects.
+
+#### Credential Lifecycle in dev.sh
+
+```bash
+CRED_SHARED_DIR="$HOME/.claude/mnt/credentials"
+CRED_SHARED_FILE="$CRED_SHARED_DIR/.credentials.json"
+
+credential_ensure() {
+  # Make sure the shared file exists so Docker doesn't create it as a directory
+  mkdir -p "$CRED_SHARED_DIR"
+  if [[ ! -f "$CRED_SHARED_FILE" ]]; then
+    touch "$CRED_SHARED_FILE"
+    chmod 600 "$CRED_SHARED_FILE"
+  fi
+
+  # Start the keychain sync watcher if credential-sync is installed
+  if command -v credential-sync &>/dev/null; then
+    credential-sync start
+  else
+    echo "Warning: credential-sync not installed. Keychain won't stay in sync." >&2
+    echo "  Containers still share credentials via bind-mount." >&2
+  fi
+}
+
+credential_stop() {
+  if command -v credential-sync &>/dev/null; then
+    credential-sync stop
+  fi
+}
+```
+
+`credential_ensure` is called from `cmd_up()` before `compose up`. It's idempotent — all projects share the same global file. If `credential-sync` isn't installed, containers still share the bind-mounted file for inter-container sync; only Keychain sync is lost.
+
+#### Fallback: No credential-sync
+
+If `credential-sync` isn't installed, the system degrades gracefully:
+1. `credential_ensure()` still creates the shared file directory and touches the file
+2. The entrypoint detects an empty file (`! -s`) and copies credentials from the host read-only mount
+3. Inter-container sync still works (same bind-mounted file)
+4. Only Keychain sync is lost — the host's Keychain won't be updated when containers refresh tokens
 
 ### Spawning Headless Agents
 
 ```bash
 docker exec -d "{project}-{name}" \
-  bash -c "claude --dangerously-skip-permissions -p '$escaped_prompt' \
+  bash -c "claude -p '$escaped_prompt' \
     > /repo/.worktrees/$name/.claude-agent.log 2>&1"
 ```
 
+The container's claude wrapper automatically includes `--dangerously-skip-permissions` — no need to pass it explicitly.
+
 ### Attaching to Running Agents
 
-1. Kill headless: `docker exec "{project}-{name}" pkill -f "claude.*dangerously-skip-permissions"`
+1. Kill headless: `docker exec "{project}-{name}" pkill -f "claude.*-p"`
 2. Show context: `git log --oneline -5` + `git diff --stat`
 3. Attach: `docker compose exec dev claude --continue`
 
@@ -724,7 +883,6 @@ cmd_handoff() {
   fi
 
   validate_name "$WORKSPACE"
-  sync_claude_credentials
   compose_env "$WORKSPACE"
 
   if ! is_running "$WORKSPACE"; then
@@ -736,10 +894,9 @@ cmd_handoff() {
   sed -i '' "s/^status: pending/status: active/" "$handoff_file" 2>/dev/null || \
     sed -i "s/^status: pending/status: active/" "$handoff_file"
 
-  echo "Starting handoff '$shortcode' in container doess-$WORKSPACE..."
+  echo "Starting handoff '$shortcode' in container ${PROJECT_NAME}-$WORKSPACE..."
   compose exec dev claude \
-    --append-system-prompt-file "/repo/.claude/handoffs/$shortcode.md" \
-    --dangerously-skip-permissions
+    --append-system-prompt-file "/repo/.claude/handoffs/$shortcode.md"
 
   # After claude exits, check if the agent marked it completed
   status="$(sed -n 's/^status: *//p' "$handoff_file")"
@@ -902,6 +1059,7 @@ Every containerized-dev project has a manifest — the set of resources the skil
 | Host daemon | `dev/daemon.cjs` | When project needs host services (builds, proxy, etc.) |
 | Host build helper | `dev/host-build` | When container can't build certain targets |
 | Caddy site config | `dev/caddy.json` | When project uses custom local domains (Reverse Proxy section) |
+| Credential sync | `~/.local/bin/credential-sync` | Global (shared across projects), Credential Sync section |
 
 ### Handoff Command Template
 
@@ -1215,7 +1373,7 @@ Workspace removal (any path) calls `deregisterSiteBlock` to remove the block fro
 The daemon is the extension point for any host-only capability containers need. Common patterns:
 
 - **Build services**: Proxy builds requiring host SDKs/toolchains (Metal, Xcode, etc.)
-- **Credential sync**: Expose host keychain/secret-manager lookups
+- **Credential sync**: Handled by shared bind-mount + host-side watcher (see Credential Sync section), not the daemon
 - **File watching**: Trigger container actions on host filesystem events
 - **Reverse proxy management**: Register/deregister Caddy site blocks per workspace
 

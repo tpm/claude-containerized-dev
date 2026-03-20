@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x /Users/woz/Work/claude-containerized-dev/plugins/containerized-dev-plugin/skills/containerized-dev/resources/credential-sync)",
+      "Bash(cp /Users/woz/Work/claude-containerized-dev/plugins/containerized-dev-plugin/skills/containerized-dev/resources/credential-sync ~/.local/bin/credential-sync && chmod +x ~/.local/bin/credential-sync && echo \"installed\")",
+      "Bash(cp /Users/woz/Work/claude-containerized-dev/plugins/containerized-dev-plugin/skills/containerized-dev/resources/credential-sync ~/.local/bin/credential-sync && chmod +x ~/.local/bin/credential-sync && echo \"synced\")"
+    ]
+  }
+}
