@@ -109,6 +109,8 @@ PORT_RANGE_END=5999
 
 allocate_port() {
   local key="$1"  # project:workspace
+  local range_start="${2:-$PORT_RANGE_START}"
+  local range_end="${3:-$PORT_RANGE_END}"
   mkdir -p "$(dirname "$GLOBAL_PORTS_FILE")"
   [[ -f "$GLOBAL_PORTS_FILE" ]] || echo '{}' > "$GLOBAL_PORTS_FILE"
   python3 -c "
@@ -118,7 +120,7 @@ if '$key' in d:
     print(d['$key'])
 else:
     used = set(d.values())
-    for p in range($PORT_RANGE_START, $PORT_RANGE_END + 1):
+    for p in range($range_start, $range_end + 1):
         if p not in used:
             d['$key'] = p
             json.dump(d, open('$GLOBAL_PORTS_FILE', 'w'), indent=2)
@@ -127,6 +129,10 @@ else:
     else:
         raise SystemExit('No free ports')
 "
+}
+
+allocate_daemon_port() {
+  allocate_port "${PROJECT_NAME}:daemon" "$DAEMON_PORT_RANGE_START" "$DAEMON_PORT_RANGE_END"
 }
 
 free_port() {
@@ -198,6 +204,7 @@ dev/
 | `handoffs [list\|clean]` | List handoff status or clean completed |
 | `build` | Build dev Docker image |
 | `base` | Build base Docker image |
+| `reset` | Nuke container + volumes, rebuild, restart |
 
 ### dev.sh Structure
 
@@ -212,6 +219,8 @@ WORKTREES_DIR="$REPO_ROOT/.worktrees"
 GLOBAL_PORTS_FILE="$HOME/.local/share/dev-workspaces/ports.json"
 PORT_RANGE_START=5173
 PORT_RANGE_END=5999
+DAEMON_PORT_RANGE_START=7701
+DAEMON_PORT_RANGE_END=7799
 WORKSPACE="root"
 ```
 
@@ -239,15 +248,16 @@ services:
       # Anonymous volume for deps (keeps image layer, not overwritten by mount)
       - /repo/${DEP_DIR}
       # Claude: container's own persistent state + host config read-only
-      - claude-state:/root/.claude
+      - claude-state:/home/dev/.claude
       - ${HOST_HOME:-~}/.claude:/host-claude:ro
       # Shared bind-mount — all containers see the same credential file instantly via virtiofs
-      - ${HOST_HOME:-~}/.claude/mnt/credentials/.credentials.json:/root/.claude/.credentials.json
+      - ${HOST_HOME:-~}/.claude/mnt/credentials/.credentials.json:/home/dev/.claude/.credentials.json
     ports:
       - "${HOST_PORT:-5173}:${DEV_PORT:-5173}"
     environment:
       - DEV_PORT=${DEV_PORT:-5173}
       - WORKSPACE=${WORKSPACE:-root}
+      - DAEMON_PORT=${DAEMON_PORT}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     stdin_open: true
@@ -342,6 +352,9 @@ RUN npm install -g @anthropic-ai/claude-code
 # RUN curl -fsSL https://deb.nodesource.com/setup_23.x | bash - \
 #     && apt-get install -y nodejs \
 #     && npm install -g @anthropic-ai/claude-code
+
+# Non-root user for Claude (--dangerously-skip-permissions refuses root)
+RUN useradd -m -s /bin/bash dev
 ```
 
 ### Dockerfile Template
@@ -356,6 +369,17 @@ COPY {dep_files} ./
 RUN {install_cmd}
 
 COPY . .
+
+# Env setup for dev user's interactive shells
+RUN echo 'test -f /root/.env.docker && . /root/.env.docker' >> /home/dev/.bashrc
+
+# Pre-configure Claude Code for both root and dev users — skip all onboarding/prompts
+# Onboarding state lives in ~/.claude.json (NOT ~/.claude/settings.json)
+RUN mkdir -p /root/.claude /home/dev/.claude \
+    && echo '{"hasCompletedOnboarding":true,"theme":"dark"}' | tee /root/.claude.json /home/dev/.claude.json > /dev/null \
+    && echo '{"skipDangerousModePermissionPrompt":true}' | tee /root/.claude/settings.json /home/dev/.claude/settings.json > /dev/null \
+    && chown dev:dev /home/dev/.claude.json \
+    && chown -R dev:dev /home/dev/.claude
 
 COPY dev/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 ENTRYPOINT ["docker-entrypoint.sh"]
@@ -389,12 +413,12 @@ if [[ -f /root/.env.docker ]]; then
 fi
 
 # ── Claude state setup ───────────────────────────────────────────────────────
-# Container gets its own persistent state at /root/.claude (named volume).
+# Container gets its own persistent state at /home/dev/.claude (named volume).
 # Host Claude config is read-only at /host-claude.
 # dev/claude-sharing.json declares what to share.
 
 HOST_CLAUDE="/host-claude"
-CLAUDE_DIR="/root/.claude"
+CLAUDE_DIR="/home/dev/.claude"
 SHARING_CONFIG="/repo/dev/claude-sharing.json"
 
 setup_claude_state() {
@@ -422,31 +446,39 @@ else:
 print(f'skill_excludes={\" \".join(s.get(\"exclude\", []))}')
 " 2>/dev/null)" || return
 
-  # Credentials — shared bind-mount provides ~/.claude/.credentials.json from host.
-  # Docker creates the file as empty if the host path doesn't exist yet; use -s (not -f) to detect that.
-  if [[ "\$share_creds" == "true" ]]; then
-    if [[ ! -s "\$CLAUDE_DIR/.credentials.json" ]] && [[ -f "\$HOST_CLAUDE/.credentials.json" ]]; then
-      cp -f "\$HOST_CLAUDE/.credentials.json" "\$CLAUDE_DIR/.credentials.json"
-    fi
-    # Mark Claude as already initialized so it skips the onboarding/login flow
-    if [[ -f /root/.claude.json ]]; then
-      python3 -c "
-import json
-with open('/root/.claude.json') as f: d = json.load(f)
-d['hasCompletedOnboarding'] = True
-with open('/root/.claude.json', 'w') as f: json.dump(d, f, indent=2)
-"
-    else
-      echo '{"hasCompletedOnboarding":true}' > /root/.claude.json
-    fi
+  # Credentials — copy (not symlink) so Claude Code can write/refresh tokens.
+  # Remove stale symlinks first — cp -f follows symlinks to ro mount and fails.
+  if [[ "\$share_creds" == "true" ]] && [[ -f "\$HOST_CLAUDE/.credentials.json" ]]; then
+    rm -f "\$CLAUDE_DIR/.credentials.json"
+    cp "\$HOST_CLAUDE/.credentials.json" "\$CLAUDE_DIR/.credentials.json"
   fi
 
+  # Onboarding state lives in ~/.claude.json (home dir, NOT inside ~/.claude/)
+  # settings.json is for permissions/config only
+  for home in /root /home/dev; do
+    python3 -c "
+import json, os
+p = '\$home/.claude.json'
+d = json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) > 0 else {}
+d['hasCompletedOnboarding'] = True
+d.setdefault('theme', 'dark')
+json.dump(d, open(p, 'w'), indent=2)
+" 2>/dev/null || true
+    python3 -c "
+import json, os
+p = '\$home/.claude/settings.json'
+d = json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) > 0 else {}
+d['skipDangerousModePermissionPrompt'] = True
+json.dump(d, open(p, 'w'), indent=2)
+" 2>/dev/null || true
+  done
+
   # Wrap claude to skip permissions (containers are already sandboxed)
-  # IS_SANDBOX=1 tells Claude Code to allow --dangerously-skip-permissions as root
+  # Claude runs as non-root 'dev' user so --dangerously-skip-permissions works directly
   if [[ -L /usr/local/bin/claude ]]; then
     CLAUDE_REAL="\$(readlink -f /usr/local/bin/claude)"
     rm /usr/local/bin/claude
-    printf '#!/bin/bash\nexport IS_SANDBOX=1\nexec "%s" --dangerously-skip-permissions "\$@"\n' "\$CLAUDE_REAL" > /usr/local/bin/claude
+    printf '#!/bin/bash\nexec "%s" --dangerously-skip-permissions "\$@"\n' "\$CLAUDE_REAL" > /usr/local/bin/claude
     chmod +x /usr/local/bin/claude
   fi
 
@@ -482,6 +514,25 @@ install_container_skill() {
 }
 
 setup_claude_state
+
+# Ensure dev user owns their Claude state
+chown -R dev:dev /home/dev/.claude /home/dev/.claude.json 2>/dev/null || true
+
+# Mirror credentials to root so `claude` works from root shell too
+mkdir -p /root/.claude
+cp -f "$CLAUDE_DIR/.credentials.json" /root/.claude/.credentials.json 2>/dev/null || true
+
+# Allow dev user to write build artifact and cache directories
+# (project-type-specific — uncomment/adapt as needed)
+# Rust:
+# chmod -R a+rwX /usr/local/cargo/registry /usr/local/cargo/git 2>/dev/null || true
+# mkdir -p /repo/target && chmod -R a+rwX /repo/target 2>/dev/null || true
+# Node.js:
+# chmod -R a+rwX /root/.npm 2>/dev/null || true
+# Python:
+# chmod -R a+rwX /root/.cache/pip 2>/dev/null || true
+# Go:
+# chmod -R a+rwX /root/go/pkg/mod 2>/dev/null || true
 
 exec "$@"
 ```
@@ -520,11 +571,22 @@ Stop container first, then remove worktree, branch, and free the port.
 
 ### Claude State Management
 
-Containers get their **own persistent Claude state** via a named Docker volume (`claude-state`), separate from the host's `~/.claude`. The host's Claude config is mounted read-only at `/host-claude`. On container startup, the entrypoint reads `dev/claude-sharing.json` and symlinks declared items into the container's `/root/.claude/`.
+Containers get their **own persistent Claude state** via a named Docker volume (`claude-state`), separate from the host's `~/.claude`. The host's Claude config is mounted read-only at `/host-claude`. On container startup, the entrypoint reads `dev/claude-sharing.json` and copies declared items into the container's `/home/dev/.claude/`.
 
-**Permissions**: The entrypoint wraps the `claude` binary to always pass `--dangerously-skip-permissions` with `IS_SANDBOX=1`. Containers run as root by default, and Claude Code rejects `--dangerously-skip-permissions` as root unless `IS_SANDBOX=1` is set. Containers are already sandboxed — permission prompts add friction with no security benefit. This means `claude` just works in any container context (interactive, headless, handoff) with no permission prompts.
+**Non-root user**: Claude Code refuses `--dangerously-skip-permissions` as root. All containers create a `dev` user (UID auto-assigned) in Dockerfile.base. All `compose exec` and `docker exec` calls that run `claude` must use `--user dev`. The entrypoint runs as root (to set up state and permissions), then `exec "$@"` runs the final command. When `--user dev` is passed to `docker exec`, Docker runs the command as `dev` regardless of the entrypoint's user.
 
-**Onboarding**: The entrypoint sets `hasCompletedOnboarding: true` in `/root/.claude.json` so Claude skips the first-run login flow.
+**Permissions**: The entrypoint wraps the `claude` binary to always pass `--dangerously-skip-permissions`. Containers are already sandboxed — permission prompts add friction with no security benefit. This means `claude` just works in any container context (interactive, headless, handoff) with no permission prompts.
+
+**Onboarding**: The Dockerfile pre-configures `hasCompletedOnboarding: true` and `theme: "dark"` in `~/.claude.json` for both root and dev users, and `skipDangerousModePermissionPrompt: true` in `~/.claude/settings.json`. The entrypoint also refreshes these at startup. Both files must be set — Claude Code checks `!w.theme || !w.hasCompletedOnboarding`.
+
+**Claude Code state file locations**:
+
+| What | File | Location |
+|------|------|----------|
+| Onboarding complete flag | `hasCompletedOnboarding` | `~/.claude.json` |
+| Theme selection | `theme` | `~/.claude.json` |
+| Skip dangerous-mode prompt | `skipDangerousModePermissionPrompt` | `~/.claude/settings.json` |
+| OAuth credentials | access/refresh tokens | `~/.claude/.credentials.json` |
 
 **`dev/claude-sharing.json`** — declares what host Claude state to share:
 
@@ -580,9 +642,9 @@ Container Claude sessions share OAuth tokens. When one session refreshes a token
 macOS Keychain
     ↕ (credential-sync watcher, async)
 ~/.claude/mnt/credentials/.credentials.json  (regular file on host)
-    ├── bind-mount → Container A: /root/.claude/.credentials.json
-    ├── bind-mount → Container B: /root/.claude/.credentials.json
-    └── bind-mount → Container C: /root/.claude/.credentials.json
+    ├── bind-mount → Container A: /home/dev/.claude/.credentials.json
+    ├── bind-mount → Container B: /home/dev/.claude/.credentials.json
+    └── bind-mount → Container C: /home/dev/.claude/.credentials.json
 ```
 
 - **Inter-container sync**: Instant. Same file via virtiofs. Zero delay.
@@ -652,28 +714,29 @@ If `credential-sync` isn't installed, the system degrades gracefully:
 ### Spawning Headless Agents
 
 ```bash
-docker exec -d "{project}-{name}" \
+docker exec -d --user dev "{project}-{name}" \
   bash -c "claude -p '$escaped_prompt' \
     > /repo/.worktrees/$name/.claude-agent.log 2>&1"
 ```
 
-The container's claude wrapper automatically includes `--dangerously-skip-permissions` — no need to pass it explicitly.
+The container's claude wrapper automatically includes `--dangerously-skip-permissions` — no need to pass it explicitly. The `--user dev` flag is required because Claude Code refuses `--dangerously-skip-permissions` as root.
 
 ### Attaching to Running Agents
 
 1. Kill headless: `docker exec "{project}-{name}" pkill -f "claude.*-p"`
 2. Show context: `git log --oneline -5` + `git diff --stat`
-3. Attach: `docker compose exec dev claude --continue`
+3. Attach: `docker compose exec --user dev dev claude --continue`
 
 ## Daemon (daemon.cjs)
 
-The daemon is a Node.js HTTP server that runs on the **host** and provides services to containers. It **must listen on `0.0.0.0`** (not `127.0.0.1`) so containers can reach it via `host.docker.internal:{DAEMON_PORT}`.
+The daemon is a Node.js HTTP server that runs on the **host** and provides services to containers. It reads its port from the `DAEMON_PORT` environment variable (set by `dev.sh` during `daemon_start`). It **must listen on `0.0.0.0`** (not `127.0.0.1`) so containers can reach it via `host.docker.internal:${DAEMON_PORT}`.
 
 ```javascript
+const PORT = parseInt(process.env.DAEMON_PORT, 10) || 7701;
 server.listen(PORT, "0.0.0.0", () => { ... });
 ```
 
-**Standard daemon port**: 7701 (outside the workspace port range).
+**Daemon port**: Dynamically allocated per project from range 7701-7799 via `allocate_daemon_port`. Stored in the global port registry as `{project}:daemon`. Each project gets its own port so multiple daemons can run simultaneously.
 
 ### Core Daemon Endpoints
 
@@ -690,27 +753,71 @@ server.listen(PORT, "0.0.0.0", () => { ... });
 ### Daemon Management in dev.sh
 
 ```bash
-DAEMON_PORT=7701
 DAEMON_PID_FILE="$WORKTREES_DIR/.daemon.pid"
+DAEMON_PORT_FILE="$WORKTREES_DIR/.daemon.port"
 
 daemon_start() {
   if daemon_running; then return; fi
-  nohup node "$REPO_ROOT/dev/daemon.cjs" > "$WORKTREES_DIR/.daemon.log" 2>&1 &
+  # Allocate a per-project daemon port from the global registry
+  DAEMON_PORT=$(allocate_daemon_port)
+  echo "$DAEMON_PORT" > "$DAEMON_PORT_FILE"
+  # Kill anything squatting on the daemon port (stale process, old PID file)
+  lsof -ti :"$DAEMON_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
+  rm -f "$DAEMON_PID_FILE"
+  sleep 0.3
+  ensure_worktrees_dir
+  echo "Starting dev daemon on port $DAEMON_PORT..."
+  DAEMON_PORT="$DAEMON_PORT" nohup node "$REPO_ROOT/dev/daemon.cjs" > "$WORKTREES_DIR/.daemon.log" 2>&1 &
   echo "$!" > "$DAEMON_PID_FILE"
+  sleep 0.5
+  if daemon_running; then
+    echo "Daemon started (pid $(cat "$DAEMON_PID_FILE"))."
+  else
+    echo "Error: Daemon failed to start. Check $WORKTREES_DIR/.daemon.log" >&2
+    exit 1
+  fi
+}
+
+daemon_port() {
+  # Read the allocated daemon port for this project
+  if [[ -f "$DAEMON_PORT_FILE" ]]; then
+    cat "$DAEMON_PORT_FILE"
+  else
+    DAEMON_PORT=$(allocate_daemon_port)
+    echo "$DAEMON_PORT" > "$DAEMON_PORT_FILE"
+    echo "$DAEMON_PORT"
+  fi
 }
 ```
 
-The daemon auto-starts on `./dev.sh up` and stores its PID in `.worktrees/.daemon.pid`.
+The daemon auto-starts on `./dev.sh up` and stores its PID in `.worktrees/.daemon.pid` and its port in `.worktrees/.daemon.port`. The `cmd_up()` function must call `daemon_start` before `compose up` so that `DAEMON_PORT` is set in the environment and gets passed to the container via docker-compose. Use `export DAEMON_PORT=$(daemon_port)` in `compose_env` or before any `compose` call.
+
+### Daemon Spawn: `--user dev`
+
+When daemon.cjs spawns headless Claude agents via `docker exec`, it must use `--user dev`:
+
+```javascript
+const child = spawnChild(
+  "docker",
+  [
+    "exec", "-d", "--user", "dev",
+    `${PROJECT_NAME}-${name}`,
+    "bash", "-c",
+    `claude --dangerously-skip-permissions -p '...' > ...`,
+  ],
+  { stdio: "ignore", detached: true }
+);
+```
 
 ### Container → Host Communication
 
-Containers reach the host daemon via Docker's built-in DNS:
+Containers reach the host daemon via Docker's built-in DNS and the `DAEMON_PORT` environment variable (injected by docker-compose):
 
 ```
-http://host.docker.internal:7701/endpoint
+http://host.docker.internal:${DAEMON_PORT}/endpoint
 ```
 
-This requires `extra_hosts: ["host.docker.internal:host-gateway"]` in docker-compose.yml (already in the template).
+This requires `extra_hosts: ["host.docker.internal:host-gateway"]` in docker-compose.yml (already in the template) and `DAEMON_PORT` in the environment section.
 
 ## Host Build Service (Optional)
 
@@ -895,7 +1002,7 @@ cmd_handoff() {
     sed -i "s/^status: pending/status: active/" "$handoff_file"
 
   echo "Starting handoff '$shortcode' in container ${PROJECT_NAME}-$WORKSPACE..."
-  compose exec dev claude \
+  compose exec --user dev dev claude \
     --append-system-prompt-file "/repo/.claude/handoffs/$shortcode.md"
 
   # After claude exits, check if the agent marked it completed
@@ -950,6 +1057,56 @@ cmd_handoffs() {
       ;;
   esac
 }
+```
+
+#### `cmd_reset` implementation
+
+```bash
+cmd_reset() {
+  validate_name "$WORKSPACE"
+
+  echo "Resetting workspace '$WORKSPACE'..."
+
+  # Stop daemon
+  daemon_stop
+
+  # Stop container + remove volumes
+  compose_env "$WORKSPACE"
+  compose down -v 2>/dev/null || true
+
+  # Remove cached image
+  docker image rm "${PROJECT_NAME}-dev:latest" 2>/dev/null || true
+
+  # Rebuild from scratch
+  cmd_base
+  cmd_up
+
+  echo "Workspace '$WORKSPACE' reset."
+}
+```
+
+### dev.sh: `--user dev` for all Claude invocations
+
+Every `compose exec` or `docker exec` that runs `claude` must add `--user dev` so Claude Code runs as the non-root `dev` user. This applies to:
+
+```bash
+# cmd_claude
+compose exec --user dev dev claude --dangerously-skip-permissions
+
+# cmd_spawn (interactive)
+compose exec --user dev dev claude --dangerously-skip-permissions
+
+# cmd_spawn (headless)
+docker exec -d --user dev "${PROJECT_NAME}-${name}" \
+  bash -c "claude --dangerously-skip-permissions -p '$escaped' > ..."
+
+# cmd_attach
+compose exec --user dev dev claude --dangerously-skip-permissions --continue
+
+# cmd_handoff
+compose exec --user dev dev claude \
+  --append-system-prompt-file "/repo/.claude/handoffs/$shortcode.md" \
+  --dangerously-skip-permissions
 ```
 
 ### Host Agent's Role in Handoff
@@ -1042,7 +1199,7 @@ Every containerized-dev project has a manifest — the set of resources the skil
 
 | Resource | Path | Content governed by |
 |----------|------|---------------------|
-| Entry script | `dev.sh` | dev.sh Commands + Handoff Commands sections |
+| Entry script | `dev.sh` | dev.sh Commands + Handoff Commands + Reset Command sections |
 | Compose file | `dev/docker-compose.yml` | docker-compose.yml Template section |
 | Base image | `dev/Dockerfile.base` | Dockerfile.base Template section |
 | Dev image | `dev/Dockerfile` | Dockerfile Template section |
@@ -1322,9 +1479,11 @@ The daemon already knows `PROJECT_NAME` from its context. Endpoints accept `{ wo
 ```bash
 caddy_register() {
   local ws="$1"
+  local port
+  port=$(daemon_port)
   local resp
   resp=$(curl -s -w "\n%{http_code}" -X POST \
-    "http://localhost:$DAEMON_PORT/caddy/register" \
+    "http://localhost:$port/caddy/register" \
     -H "Content-Type: application/json" \
     -d "{\"workspace\": \"$ws\"}")
   local body status
@@ -1339,7 +1498,9 @@ caddy_register() {
 
 caddy_deregister() {
   local ws="$1"
-  curl -s -X POST "http://localhost:$DAEMON_PORT/caddy/deregister" \
+  local port
+  port=$(daemon_port)
+  curl -s -X POST "http://localhost:$port/caddy/deregister" \
     -H "Content-Type: application/json" \
     -d "{\"workspace\": \"$ws\"}" > /dev/null 2>&1 || true
 }
