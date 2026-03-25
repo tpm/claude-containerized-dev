@@ -9,7 +9,7 @@
     {
       "name": "containerized-dev",
       "description": "Set up and manage containerized multi-workspace development environments with Docker. Handles global port allocation, git worktrees, Claude agent spawning, host-to-container session handoff, host daemon for container-to-host services, and project-specific container configuration.",
-      "version": "1.1.1",
+      "version": "1.2.0",
       "author": {
         "name": "Matthew Wozniak",
         "email": "matt@talkingpointsmemo.com"
